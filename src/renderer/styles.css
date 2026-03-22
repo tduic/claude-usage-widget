@@ -47,6 +47,36 @@ body {
     flex-direction: column;
 }
 
+/* Menu bar popover arrow (macOS) */
+body.menubar-mode .widget-container {
+    margin-top: 8px;
+    border-radius: 10px;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+}
+
+body.menubar-mode .widget-container::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%) translateY(-6px);
+    width: 14px;
+    height: 8px;
+    background: #1e1e2e;
+    clip-path: polygon(50% 0%, 0% 100%, 100% 100%);
+    z-index: 10;
+}
+
+/* In menu bar mode, remove the drag region from the title bar */
+body.menubar-mode .title-bar {
+    -webkit-app-region: no-drag;
+}
+
+/* Hide minimize button in menu bar mode — popover dismisses on blur */
+body.menubar-mode .minimize-btn {
+    display: none;
+}
+
 /* Title Bar */
 .title-bar {
     -webkit-app-region: drag;

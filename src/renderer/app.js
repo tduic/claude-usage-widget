@@ -102,11 +102,22 @@ async function init() {
     setupEventListeners();
     credentials = await window.electronAPI.getCredentials();
 
+    // Detect menu bar mode and apply body class for CSS
+    const isMenubar = await window.electronAPI.isMenubarMode();
+    if (isMenubar) {
+        document.body.classList.add('menubar-mode');
+        // Hide settings that don't apply in menu bar mode
+        const alwaysOnTopRow = document.getElementById('alwaysOnTopToggle');
+        const trayRow = document.getElementById('minimizeToTrayToggle');
+        if (alwaysOnTopRow) alwaysOnTopRow.closest('.settings-col').style.display = 'none';
+        if (trayRow) trayRow.closest('.settings-col').style.display = 'none';
+    }
+
     // Apply saved theme and load thresholds immediately
     const settings = await window.electronAPI.getSettings();
     window._cachedSettings = settings;
     applyTheme(settings.theme);
-    if (window.electronAPI.platform === 'darwin') {
+    if (!isMenubar && window.electronAPI.platform === 'darwin') {
         document.getElementById('trayLabel').textContent = 'Hide from Dock';
     }
     warnThreshold = settings.warnThreshold;
@@ -1377,7 +1388,7 @@ async function loadSettings() {
     });
 
     applyTheme(settings.theme);
-    if (window.electronAPI.platform === 'darwin') {
+    if (!document.body.classList.contains('menubar-mode') && window.electronAPI.platform === 'darwin') {
         document.getElementById('trayLabel').textContent = 'Hide from Dock';
     }
 }
@@ -1414,7 +1425,7 @@ async function saveSettings() {
     await window.electronAPI.saveSettings(settings);
     window._cachedSettings = settings;
     applyTheme(settings.theme);
-    if (window.electronAPI.platform === 'darwin') {
+    if (!document.body.classList.contains('menubar-mode') && window.electronAPI.platform === 'darwin') {
         document.getElementById('trayLabel').textContent = 'Hide from Dock';
     }
 

@@ -55,6 +55,12 @@ const CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit
 let mainWindow = null;
 let tray = null;
 
+// Menu bar mode: window anchored below tray icon
+const MENUBAR_MODE = process.platform === 'darwin';
+
+// Guard: prevent blur-to-dismiss while a child window (login, etc.) is open
+let childWindowOpen = false;
+
 const WIDGET_WIDTH = process.platform === 'darwin' ? 590 : 560;
 const WIDGET_HEIGHT = 155;
 const HISTORY_RETENTION_DAYS = 30;
@@ -104,16 +110,45 @@ async function setSessionCookie(sessionKey) {
   debugLog('sessionKey cookie set in Electron session');
 }
 
+function getWindowPositionFromTray() {
+  const { screen } = require('electron');
+
+  if (!tray) {
+    // Fallback: center horizontally on primary display, just below the menu bar
+    const primary = screen.getPrimaryDisplay();
+    return {
+      x: Math.round(primary.bounds.x + (primary.bounds.width - WIDGET_WIDTH) / 2),
+      y: Math.round(primary.bounds.y + 40)
+    };
+  }
+
+  const trayBounds = tray.getBounds();
+
+  // Validate tray bounds — some macOS configurations return zeros
+  if (!trayBounds || trayBounds.width <= 0 || trayBounds.height <= 0) {
+    const primary = screen.getPrimaryDisplay();
+    return {
+      x: Math.round(primary.bounds.x + (primary.bounds.width - WIDGET_WIDTH) / 2),
+      y: Math.round(primary.bounds.y + 40)
+    };
+  }
+
+  // Center the window horizontally under the tray icon
+  const x = Math.round(trayBounds.x + (trayBounds.width / 2) - (WIDGET_WIDTH / 2));
+  // Position directly below the tray icon (macOS menu bar is at top)
+  const y = Math.round(trayBounds.y + trayBounds.height + 4);
+  return { x, y };
+}
+
 function createMainWindow() {
-  const savedPosition = store.get('windowPosition');
   const windowOptions = {
     width: WIDGET_WIDTH,
     height: WIDGET_HEIGHT,
     frame: false,
     transparent: true,
-    alwaysOnTop: true,
     resizable: false,
-    skipTaskbar: false,
+    skipTaskbar: true,
+    show: false, // Don't show until positioned
     icon: path.join(__dirname, process.platform === 'darwin' ? 'assets/icon.icns' : process.platform === 'linux' ? 'assets/logo.png' : 'assets/icon.ico'),
     webPreferences: {
       nodeIntegration: false,
@@ -122,22 +157,47 @@ function createMainWindow() {
     }
   };
 
-  if (savedPosition) {
-    windowOptions.x = savedPosition.x;
-    windowOptions.y = savedPosition.y;
+  if (MENUBAR_MODE) {
+    // macOS menu bar popover behavior
+    windowOptions.alwaysOnTop = true;
+    windowOptions.fullscreenable = false;
+    // Level 'pop-up-menu' keeps the window above other apps but below the menu bar
+    windowOptions.type = 'panel';
+  } else {
+    // Non-macOS: keep the original floating behavior with saved position
+    const savedPosition = store.get('windowPosition');
+    windowOptions.alwaysOnTop = store.get('settings.alwaysOnTop', true);
+    if (savedPosition) {
+      windowOptions.x = savedPosition.x;
+      windowOptions.y = savedPosition.y;
+    }
+    windowOptions.show = true;
   }
 
   mainWindow = new BrowserWindow(windowOptions);
   mainWindow.loadFile('src/renderer/index.html');
 
-  let positionSaveTimer = null;
-  mainWindow.on('move', () => {
-    if (positionSaveTimer) clearTimeout(positionSaveTimer);
-    positionSaveTimer = setTimeout(() => {
-      const position = mainWindow.getBounds();
-      store.set('windowPosition', { x: position.x, y: position.y });
-    }, 300);
-  });
+  if (MENUBAR_MODE) {
+    // Hide from Dock — this is a menu bar–only app on macOS
+    app.dock.hide();
+
+    // Dismiss the popover when it loses focus (unless a child window like login is open)
+    mainWindow.on('blur', () => {
+      if (mainWindow && mainWindow.isVisible() && !childWindowOpen) {
+        mainWindow.hide();
+      }
+    });
+  } else {
+    // Non-macOS: save position on move (original behavior)
+    let positionSaveTimer = null;
+    mainWindow.on('move', () => {
+      if (positionSaveTimer) clearTimeout(positionSaveTimer);
+      positionSaveTimer = setTimeout(() => {
+        const position = mainWindow.getBounds();
+        store.set('windowPosition', { x: position.x, y: position.y });
+      }, 300);
+    });
+  }
 
   mainWindow.on('closed', () => {
     mainWindow = null;
@@ -145,6 +205,26 @@ function createMainWindow() {
 
   if (process.env.NODE_ENV === 'development') {
     mainWindow.webContents.openDevTools({ mode: 'detach' });
+  }
+}
+
+function togglePopover() {
+  if (!mainWindow) {
+    createMainWindow();
+    const pos = getWindowPositionFromTray();
+    mainWindow.setPosition(pos.x, pos.y);
+    mainWindow.show();
+    mainWindow.focus();
+    return;
+  }
+  if (mainWindow.isVisible()) {
+    mainWindow.hide();
+  } else {
+    // Re-position under the tray icon each time (in case display changed)
+    const pos = getWindowPositionFromTray();
+    mainWindow.setPosition(pos.x, pos.y);
+    mainWindow.show();
+    mainWindow.focus();
   }
 }
 
@@ -156,12 +236,16 @@ function createTray() {
       {
         label: 'Show Widget',
         click: () => {
-          if (mainWindow) {
-            if (mainWindow.isMinimized()) mainWindow.restore();
-            mainWindow.show();
-            mainWindow.focus();
+          if (MENUBAR_MODE) {
+            togglePopover();
           } else {
-            createMainWindow();
+            if (mainWindow) {
+              if (mainWindow.isMinimized()) mainWindow.restore();
+              mainWindow.show();
+              mainWindow.focus();
+            } else {
+              createMainWindow();
+            }
           }
         }
       },
@@ -203,19 +287,34 @@ function createTray() {
     ]);
 
     tray.setToolTip('Claude Usage Widget');
-    tray.setContextMenu(contextMenu);
 
-    tray.on('click', () => {
-      if (mainWindow) {
-        if (mainWindow.isVisible() && !mainWindow.isMinimized()) {
-          mainWindow.hide();
-        } else {
-          if (mainWindow.isMinimized()) mainWindow.restore();
-          mainWindow.show();
-          mainWindow.focus();
+    if (MENUBAR_MODE) {
+      // macOS menu bar mode:
+      // Do NOT call tray.setContextMenu() — that overrides left-click on macOS
+      // and always shows the menu. Instead, left-click toggles the popover
+      // and right-click manually pops up the context menu.
+      tray.on('click', () => {
+        togglePopover();
+      });
+      tray.on('right-click', () => {
+        tray.popUpContextMenu(contextMenu);
+      });
+    } else {
+      // Non-macOS: set context menu normally (right-click shows menu)
+      tray.setContextMenu(contextMenu);
+
+      tray.on('click', () => {
+        if (mainWindow) {
+          if (mainWindow.isVisible() && !mainWindow.isMinimized()) {
+            mainWindow.hide();
+          } else {
+            if (mainWindow.isMinimized()) mainWindow.restore();
+            mainWindow.show();
+            mainWindow.focus();
+          }
         }
-      }
-    });
+      });
+    }
   } catch (error) {
     console.error('Failed to create tray:', error);
   }
@@ -312,9 +411,10 @@ ipcMain.handle('validate-session-key', async (event, sessionKey) => {
 
 ipcMain.on('minimize-window', () => {
   if (mainWindow) {
-    // macOS: minimize to Dock so the user can restore via Dock click
-    // Windows/Linux: hide to tray (taskbar may be hidden, tray is the restore path)
-    if (process.platform === 'darwin') {
+    if (MENUBAR_MODE) {
+      // Menu bar mode: just hide the popover
+      mainWindow.hide();
+    } else if (process.platform === 'darwin') {
       mainWindow.minimize();
     } else {
       mainWindow.hide();
@@ -367,6 +467,10 @@ ipcMain.on('open-external', (event, url) => {
 
 ipcMain.handle('get-app-version', () => {
   return app.getVersion();
+});
+
+ipcMain.handle('is-menubar-mode', () => {
+  return MENUBAR_MODE;
 });
 
 ipcMain.handle('get-usage-history', () => {
@@ -440,12 +544,17 @@ ipcMain.handle('save-settings', (event, settings) => {
   }
 
   if (mainWindow) {
-    if (process.platform === 'darwin') {
-      if (settings.minimizeToTray) { app.dock.hide(); } else { app.dock.show(); }
+    if (MENUBAR_MODE) {
+      // Menu bar mode: dock is always hidden, always-on-top is managed by window type
+      // No need to apply minimizeToTray or alwaysOnTop settings
     } else {
-      mainWindow.setSkipTaskbar(settings.minimizeToTray);
+      if (process.platform === 'darwin') {
+        if (settings.minimizeToTray) { app.dock.hide(); } else { app.dock.show(); }
+      } else {
+        mainWindow.setSkipTaskbar(settings.minimizeToTray);
+      }
+      mainWindow.setAlwaysOnTop(settings.alwaysOnTop, 'floating');
     }
-    mainWindow.setAlwaysOnTop(settings.alwaysOnTop, 'floating');
   }
 
   return true;
@@ -464,6 +573,8 @@ ipcMain.handle('detect-session-key', async () => {
   try {
     await session.defaultSession.cookies.remove('https://claude.ai', 'sessionKey');
   } catch (e) { /* ignore */ }
+
+  childWindowOpen = true;
 
   return new Promise((resolve) => {
     const loginWin = new BrowserWindow({
@@ -496,6 +607,7 @@ ipcMain.handle('detect-session-key', async () => {
     session.defaultSession.cookies.on('changed', onCookieChanged);
 
     loginWin.on('closed', () => {
+      childWindowOpen = false;
       session.defaultSession.cookies.removeListener('changed', onCookieChanged);
       if (!resolved) {
         resolve({ success: false, error: 'Login window closed' });
@@ -659,7 +771,7 @@ ipcMain.handle('fetch-usage-data', async () => {
   // Re-assert always-on-top after hidden BrowserWindows from fetchViaWindow
   // are destroyed — creating/destroying BrowserWindows can temporarily disrupt
   // the main window's z-order on some OS/window manager combinations.
-  if (mainWindow && !mainWindow.isDestroyed()) {
+  if (!MENUBAR_MODE && mainWindow && !mainWindow.isDestroyed()) {
     const alwaysOnTop = store.get('settings.alwaysOnTop', true);
     if (alwaysOnTop) {
       mainWindow.setAlwaysOnTop(true, 'floating');
@@ -690,31 +802,41 @@ app.whenReady().then(async () => {
     await setSessionCookie(sessionKey);
   }
 
-  createMainWindow();
+  // Create tray FIRST so window can position relative to it
   createTray();
+  createMainWindow();
 
-  // Apply persisted settings
-  const minimizeToTray = store.get('settings.minimizeToTray', false);
-  const alwaysOnTop = store.get('settings.alwaysOnTop', true);
-  if (mainWindow) {
-    if (process.platform === 'darwin') {
-      if (minimizeToTray) app.dock.hide();
-    } else {
+  if (MENUBAR_MODE) {
+    // macOS menu bar mode: position popover under tray, start hidden
+    const pos = getWindowPositionFromTray();
+    mainWindow.setPosition(pos.x, pos.y);
+    // Don't show on launch — user clicks the tray icon to open
+
+    // Auto-enable launch-at-login on first run (menu bar apps should always auto-start)
+    if (!store.has('settings.autoStartInitialized')) {
+      store.set('settings.autoStart', true);
+      store.set('settings.autoStartInitialized', true);
+      app.setLoginItemSettings({ openAtLogin: true });
+    }
+  } else {
+    // Non-macOS: apply persisted settings
+    const minimizeToTray = store.get('settings.minimizeToTray', false);
+    const alwaysOnTop = store.get('settings.alwaysOnTop', true);
+    if (mainWindow) {
       if (minimizeToTray) mainWindow.setSkipTaskbar(true);
+      mainWindow.setAlwaysOnTop(alwaysOnTop, 'floating');
     }
-    mainWindow.setAlwaysOnTop(alwaysOnTop, 'floating');
-  }
 
-  // Periodic always-on-top re-assertion to recover from z-order disruptions
-  // (hidden window spawns, window manager shortcuts, alt-tab, etc.)
-  setInterval(() => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      const alwaysOnTopSetting = store.get('settings.alwaysOnTop', true);
-      if (alwaysOnTopSetting) {
-        mainWindow.setAlwaysOnTop(true, 'floating');
+    // Periodic always-on-top re-assertion (not needed in menu bar mode)
+    setInterval(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        const alwaysOnTopSetting = store.get('settings.alwaysOnTop', true);
+        if (alwaysOnTopSetting) {
+          mainWindow.setAlwaysOnTop(true, 'floating');
+        }
       }
-    }
-  }, 5000);
+    }, 5000);
+  }
 });
 
 app.on('window-all-closed', () => {
@@ -724,12 +846,21 @@ app.on('window-all-closed', () => {
 });
 
 app.on('activate', () => {
-  if (mainWindow === null) {
-    createMainWindow();
-  } else {
-    if (mainWindow.isMinimized()) mainWindow.restore();
+  if (MENUBAR_MODE) {
+    // In menu bar mode, dock is hidden. This handles Spotlight or other activation.
+    if (!mainWindow) createMainWindow();
+    const pos = getWindowPositionFromTray();
+    mainWindow.setPosition(pos.x, pos.y);
     mainWindow.show();
     mainWindow.focus();
+  } else {
+    if (mainWindow === null) {
+      createMainWindow();
+    } else {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    }
   }
 });
 
@@ -739,8 +870,11 @@ if (!gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (mainWindow) {
+    if (MENUBAR_MODE) {
+      togglePopover();
+    } else if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
       mainWindow.focus();
     }
   });
