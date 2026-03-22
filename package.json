@@ -60,7 +60,14 @@
     "files": [
       "**/*",
       "!**/*.ts",
-      "!*.md"
+      "!*.md",
+      "!mnt",
+      "!mnt/**/*",
+      "!tmp",
+      "!tmp/**/*",
+      "!.bash_logout",
+      "!.bashrc",
+      "!.profile"
     ],
     "mac": {
       "target": [
